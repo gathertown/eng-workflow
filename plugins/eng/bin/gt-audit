@@ -1,0 +1,506 @@
+#!/usr/bin/env bash
+
+# Reports branch changes whose file contents cannot be found in reachable history.
+#
+# Reads the log the reference-transaction hook writes. Findings do not fail the command that
+# called the audit. Stdout stays empty when every selected ref move is accounted for.
+
+set -uo pipefail
+
+SCRIPTDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# shellcheck source=./lib/stdlib.sh
+source "$SCRIPTDIR/lib/stdlib.sh"
+# shellcheck source=./lib/gt-audit-content.sh
+source "$SCRIPTDIR/lib/gt-audit-content.sh"
+# shellcheck source=./lib/gt-audit-history.sh
+source "$SCRIPTDIR/lib/gt-audit-history.sh"
+
+readonly SUPPRESSED_SUBCOMMANDS="squash fold absorb modify split reorder" SURVIVING_HISTORY_WINDOW="6 months ago"
+readonly MAX_VIRTUAL_COMPARISONS="${GT_AUDIT_MAX_VIRTUAL_COMPARISONS:-20}"
+
+SINCE="30m" LOG_PATH="" MODE="audit" EXPLAIN=0 ALL_WORKTREES=0
+WORKDIR="" ATTEMPT_DIR="" ATTEMPT_GLOBAL_REASON="" SNAPSHOT_REF_RECORDS=""
+VIRTUAL_COMPARISONS=0 TOTAL_VIRTUAL_COMPARISONS=0 REFS_CHANGED=0
+
+declare -a ENTRY_CANDIDATE_FILES=() ENTRY_REASONS=() ENTRY_OLD_KEYS=() ENTRY_HAS_WORK=()
+declare -A OLD_SEEN=() OLD_STATUS=() OLD_METHOD=() OLD_PRESERVING_OID=() OLD_REASON=()
+declare -A OLD_HINT_FILES=() OLD_CANDIDATE_FILES=() PAIR_STATUS=() PAIR_METHOD=()
+declare -A PAIR_PRESERVING_OID=() PAIR_REASON=()
+
+usage() {
+  echo "Usage: $(basename "$0") [FLAGS]"
+  echo
+  echo "Reports branch changes whose contents cannot be found in reachable history."
+  echo
+  echo "FLAGS"
+  echo "  --since DURATION   How far back to read, e.g. 45m, 6h, 3d (default: $SINCE)"
+  echo "  --list             Print the ref moves in the window instead of auditing them"
+  echo "  --all-worktrees    Read moves made in every worktree, not just this one"
+  echo "  --explain          Print content-comparison details on stderr"
+  echo "  --log PATH         Read a specific audit log"
+  echo "  --help,-h          Show this help page"
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+  --since)
+    SINCE="${2:?--since needs a duration}"
+    shift 2
+    ;;
+  --list)
+    MODE="list"
+    shift
+    ;;
+  --all-worktrees)
+    ALL_WORKTREES=1
+    shift
+    ;;
+  --explain)
+    EXPLAIN=1
+    shift
+    ;;
+  --log)
+    LOG_PATH="${2:?--log needs a path}"
+    shift 2
+    ;;
+  --help | -h)
+    usage
+    exit 0
+    ;;
+  *)
+    error "Unknown option: $1"
+    usage >&2
+    exit 2
+    ;;
+  esac
+done
+
+[[ "$MAX_VIRTUAL_COMPARISONS" =~ ^[1-9][0-9]*$ ]] ||
+  fatal "Invalid GT_AUDIT_MAX_VIRTUAL_COMPARISONS: $MAX_VIRTUAL_COMPARISONS"
+
+iso_since() {
+  local duration="$1" count gnu_unit bsd_unit
+  [[ "$duration" =~ ^([0-9]+)([mhd])$ ]] || return 1
+  count="${BASH_REMATCH[1]}"
+  # BSD date uses M for minutes and H for hours.
+  case "${BASH_REMATCH[2]}" in
+  m)
+    gnu_unit=minutes
+    bsd_unit=M
+    ;;
+  h)
+    gnu_unit=hours
+    bsd_unit=H
+    ;;
+  d)
+    gnu_unit=days
+    bsd_unit=d
+    ;;
+  esac
+  date -u -d "-$count $gnu_unit" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null ||
+    date -u -v"-${count}${bsd_unit}" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null
+}
+
+is_suppressed() {
+  local subcommand
+  read -r _ subcommand _ <<<"$1"
+  [[ -n "${subcommand:-}" ]] || return 1
+  [[ " $SUPPRESSED_SUBCOMMANDS " == *" $subcommand "* ]]
+}
+
+cleanup() {
+  audit_remove_repository
+  if [[ -n "$WORKDIR" && "$WORKDIR" == */.repo/local/tmp/gt-audit.* ]]; then
+    rm -rf "$WORKDIR"
+  fi
+}
+
+reset_attempt() {
+  local key
+  ENTRY_CANDIDATE_FILES=()
+  ENTRY_REASONS=()
+  ENTRY_OLD_KEYS=()
+  ENTRY_HAS_WORK=()
+  for key in "${!OLD_SEEN[@]}"; do unset "OLD_SEEN[$key]"; done
+  for key in "${!OLD_STATUS[@]}"; do unset "OLD_STATUS[$key]"; done
+  for key in "${!OLD_METHOD[@]}"; do unset "OLD_METHOD[$key]"; done
+  for key in "${!OLD_PRESERVING_OID[@]}"; do unset "OLD_PRESERVING_OID[$key]"; done
+  for key in "${!OLD_REASON[@]}"; do unset "OLD_REASON[$key]"; done
+  for key in "${!OLD_HINT_FILES[@]}"; do unset "OLD_HINT_FILES[$key]"; done
+  for key in "${!OLD_CANDIDATE_FILES[@]}"; do unset "OLD_CANDIDATE_FILES[$key]"; done
+  for key in "${!PAIR_STATUS[@]}"; do unset "PAIR_STATUS[$key]"; done
+  for key in "${!PAIR_METHOD[@]}"; do unset "PAIR_METHOD[$key]"; done
+  for key in "${!PAIR_PRESERVING_OID[@]}"; do unset "PAIR_PRESERVING_OID[$key]"; done
+  for key in "${!PAIR_REASON[@]}"; do unset "PAIR_REASON[$key]"; done
+  ATTEMPT_GLOBAL_REASON=""
+  TOTAL_VIRTUAL_COMPARISONS=0
+}
+
+is_valid_oid() {
+  local oid="$1"
+  [[ "${#oid}" -eq "$AUDIT_OID_LENGTH" && "$oid" != *[!0-9a-fA-F]* ]]
+}
+
+resolve_commit() {
+  local oid="$1"
+  is_valid_oid "$oid" || return 1
+  audit_source_git rev-parse --verify "$oid^{commit}"
+}
+
+mark_entry_incomplete() {
+  local entry_number="$1" old="$2" reason="$3"
+  ENTRY_HAS_WORK[entry_number]=1
+  ENTRY_OLD_KEYS[entry_number]="$old"
+  ENTRY_REASONS[entry_number]="$reason"
+}
+
+collect_candidates() {
+  local snapshot="$1" entry_number=0
+  local timestamp old new ref pid worktree tool git_cmd old_commit new_commit candidate_file
+  local hint_file candidate_oid_file
+  local -a tips=() exclusions=()
+  mapfile -t tips <"$snapshot"
+
+  while IFS=$'\t' read -r timestamp old new ref pid worktree tool git_cmd; do
+    entry_number=$((entry_number + 1))
+    [[ "$old" != "$AUDIT_ZERO_OID" && "$old" != "$new" ]] || continue
+    is_suppressed "$tool" && continue
+
+    if ! old_commit="$(resolve_commit "$old" 2>/dev/null)"; then
+      mark_entry_incomplete "$entry_number" "$old" "unavailable or invalid old object"
+      continue
+    fi
+
+    exclusions=("${tips[@]}")
+    if [[ "$new" != "$AUDIT_ZERO_OID" ]]; then
+      if ! new_commit="$(resolve_commit "$new" 2>/dev/null)"; then
+        mark_entry_incomplete "$entry_number" "$old_commit" "unavailable or invalid new object"
+        continue
+      fi
+      exclusions+=("$new_commit")
+    fi
+
+    candidate_file="$ATTEMPT_DIR/candidates-$entry_number"
+    if ! audit_source_git log --no-merges --format='%H%x09%s' "$old_commit" --not \
+      "${exclusions[@]}" -- >"$candidate_file"; then
+      mark_entry_incomplete "$entry_number" "$old_commit" "candidate collection failed"
+      continue
+    fi
+    [[ -s "$candidate_file" ]] || continue
+
+    ENTRY_HAS_WORK[entry_number]=1
+    ENTRY_OLD_KEYS[entry_number]="$old_commit"
+    ENTRY_CANDIDATE_FILES[entry_number]="$candidate_file"
+    OLD_SEEN[$old_commit]=1
+    hint_file="$ATTEMPT_DIR/hints-$old_commit"
+    cut -f2- "$candidate_file" >>"$hint_file"
+    OLD_HINT_FILES[$old_commit]="$hint_file"
+    candidate_oid_file="$ATTEMPT_DIR/candidate-oids-$old_commit"
+    cut -f1 "$candidate_file" >>"$candidate_oid_file"
+    OLD_CANDIDATE_FILES[$old_commit]="$candidate_oid_file"
+  done <"$ENTRIES"
+}
+
+remember_pair_result() {
+  local pair="$1" status="$2" output="$3"
+  local method preserving_oid
+  PAIR_STATUS[$pair]="$status"
+  if [[ "$status" -eq 0 ]]; then
+    IFS=$'\t' read -r method preserving_oid <"$output"
+    PAIR_METHOD[$pair]="$method"
+    PAIR_PRESERVING_OID[$pair]="$preserving_oid"
+  else
+    PAIR_REASON[$pair]="$AUDIT_CONTENT_REASON"
+  fi
+}
+
+verify_old_tip() {
+  local old_oid="$1" index="$2"
+  local old_tree exact_match pair_output pair status method preserving_oid prioritized_index
+  local near_index candidate_oids
+  local first_reason="" compared_all=1
+  VIRTUAL_COMPARISONS=0
+
+  if ! old_tree="$(audit_git rev-parse --verify "$old_oid^{tree}" 2>/dev/null)"; then
+    OLD_STATUS[$old_oid]="unverified"
+    OLD_REASON[$old_oid]="unavailable old tree"
+    return
+  fi
+
+  exact_match="$(awk -F'\t' -v tree="$old_tree" '$2 == tree { print $1; exit }' "$index")"
+  if [[ -n "$exact_match" ]]; then
+    OLD_STATUS[$old_oid]="preserved"
+    OLD_METHOD[$old_oid]="identical-tree"
+    OLD_PRESERVING_OID[$old_oid]="$exact_match"
+    return
+  fi
+
+  prioritized_index="$ATTEMPT_DIR/prioritized-$old_oid"
+  near_index="$ATTEMPT_DIR/near-$old_oid"
+  prioritize_surviving_commits "$old_oid" "$index" "$prioritized_index" "$near_index"
+
+  # Patch identity costs one diff of each side, so it runs ahead of the virtual merges and outside
+  # their budget.
+  candidate_oids="${OLD_CANDIDATE_FILES[$old_oid]:-}"
+  if [[ -n "$candidate_oids" ]] &&
+    preserving_oid="$(audit_match_patch_ids "$candidate_oids" "$near_index" \
+      "$ATTEMPT_DIR/patch-$old_oid")" && [[ -n "$preserving_oid" ]]; then
+    OLD_STATUS[$old_oid]="preserved"
+    OLD_METHOD[$old_oid]="identical-patch"
+    OLD_PRESERVING_OID[$old_oid]="$preserving_oid"
+    return
+  fi
+
+  pair_output="$ATTEMPT_DIR/pair-result"
+  while IFS=$'\t' read -r preserving_oid _; do
+    [[ -n "$preserving_oid" ]] || continue
+    pair="$old_oid:$preserving_oid"
+    if [[ -z "${PAIR_STATUS[$pair]+present}" ]]; then
+      if [[ "$VIRTUAL_COMPARISONS" -ge "$MAX_VIRTUAL_COMPARISONS" ]]; then
+        compared_all=0
+        break
+      fi
+      VIRTUAL_COMPARISONS=$((VIRTUAL_COMPARISONS + 1))
+      TOTAL_VIRTUAL_COMPARISONS=$((TOTAL_VIRTUAL_COMPARISONS + 1))
+      : >"$pair_output"
+      audit_compare_trees "$old_oid" "$preserving_oid" >"$pair_output"
+      status=$?
+      remember_pair_result "$pair" "$status" "$pair_output"
+    fi
+
+    status="${PAIR_STATUS[$pair]}"
+    if [[ "$status" -eq 0 ]]; then
+      method="${PAIR_METHOD[$pair]}"
+      OLD_STATUS[$old_oid]="preserved"
+      OLD_METHOD[$old_oid]="$method"
+      OLD_PRESERVING_OID[$old_oid]="${PAIR_PRESERVING_OID[$pair]}"
+      return
+    fi
+    [[ -n "$first_reason" ]] || first_reason="${PAIR_REASON[$pair]}"
+  done <"$prioritized_index"
+
+  OLD_STATUS[$old_oid]="unverified"
+  if [[ "$compared_all" -eq 0 ]]; then
+    if [[ -n "$first_reason" && "$first_reason" != "no matching tree" ]]; then
+      OLD_REASON[$old_oid]="$first_reason, comparison limit ($MAX_VIRTUAL_COMPARISONS) reached"
+    else
+      OLD_REASON[$old_oid]="comparison limit ($MAX_VIRTUAL_COMPARISONS) reached"
+    fi
+  elif [[ -n "$first_reason" && "$first_reason" != "no matching tree" ]]; then
+    OLD_REASON[$old_oid]="$first_reason"
+  else
+    OLD_REASON[$old_oid]="no matching tree within the six-month search window"
+  fi
+}
+
+verify_old_tips() {
+  local snapshot="$1" index="$ATTEMPT_DIR/surviving-index" old_oid
+  if ! build_surviving_index "$snapshot" "$index"; then
+    ATTEMPT_GLOBAL_REASON="reachable history search failed"
+    return
+  fi
+
+  for old_oid in "${!OLD_SEEN[@]}"; do
+    verify_old_tip "$old_oid" "$index"
+  done
+}
+
+collect_entries_without_snapshot() {
+  local reason="$1" entry_number=0
+  local timestamp old new ref pid worktree tool git_cmd
+  while IFS=$'\t' read -r timestamp old new ref pid worktree tool git_cmd; do
+    entry_number=$((entry_number + 1))
+    [[ "$old" != "$AUDIT_ZERO_OID" && "$old" != "$new" ]] || continue
+    is_suppressed "$tool" && continue
+    mark_entry_incomplete "$entry_number" "$old" "$reason"
+  done <"$ENTRIES"
+}
+
+run_attempt() {
+  local attempt="$1" initial_snapshot final_snapshot
+  reset_attempt
+  ATTEMPT_DIR="$WORKDIR/attempt-$attempt"
+  mkdir -p "$ATTEMPT_DIR"
+  initial_snapshot="$ATTEMPT_DIR/refs.initial"
+  final_snapshot="$ATTEMPT_DIR/refs.final"
+  SNAPSHOT_REF_RECORDS="$ATTEMPT_DIR/initial.refs"
+  : >"$SNAPSHOT_REF_RECORDS"
+
+  if ! audit_snapshot_refs "$initial_snapshot" "$ATTEMPT_DIR/initial"; then
+    ATTEMPT_GLOBAL_REASON="initial ref snapshot failed"
+    collect_entries_without_snapshot "$ATTEMPT_GLOBAL_REASON"
+    return 0
+  fi
+  collect_candidates "$initial_snapshot"
+  verify_old_tips "$initial_snapshot"
+
+  if ! audit_snapshot_refs "$final_snapshot" "$ATTEMPT_DIR/final"; then
+    ATTEMPT_GLOBAL_REASON="final ref snapshot failed"
+    return 1
+  fi
+  cmp -s "$ATTEMPT_DIR/initial.state" "$ATTEMPT_DIR/final.state"
+}
+
+entry_reason() {
+  local entry_number="$1" old_key="$2"
+  if [[ "$REFS_CHANGED" -eq 1 ]]; then
+    echo "refs changed during both audit attempts"
+  elif [[ -n "${ENTRY_REASONS[$entry_number]:-}" ]]; then
+    echo "${ENTRY_REASONS[$entry_number]}"
+  elif [[ -n "$ATTEMPT_GLOBAL_REASON" ]]; then
+    echo "$ATTEMPT_GLOBAL_REASON"
+  else
+    echo "${OLD_REASON[$old_key]:-preservation check failed}"
+  fi
+}
+
+entry_is_preserved() {
+  local entry_number="$1" old_key="$2"
+  [[ "$REFS_CHANGED" -eq 0 && -z "${ENTRY_REASONS[$entry_number]:-}" &&
+    -z "$ATTEMPT_GLOBAL_REASON" && "${OLD_STATUS[$old_key]:-}" == "preserved" ]]
+}
+
+recovery_branch_name() {
+  local ref="$1" old="$2" fragment candidate suffix=1
+  fragment="$(basename "$ref" | tr -c 'A-Za-z0-9._-' '-')"
+  fragment="${fragment#-}"
+  fragment="${fragment%-}"
+  [[ -n "$fragment" ]] || fragment="branch"
+  candidate="recover-$fragment"
+  while awk -F'\t' -v name="refs/heads/$candidate" '$1 == name { found = 1 } END { exit !found }' \
+    "$SNAPSHOT_REF_RECORDS"; do
+    candidate="recover-$fragment-${old:0:9}-$suffix"
+    suffix=$((suffix + 1))
+  done
+  printf "'%s'" "$candidate"
+}
+
+render_results() {
+  local entry_number=0 old_key reason recovery_name
+  local timestamp old new ref pid worktree tool git_cmd oid subject
+  local printed=0 candidate_file
+
+  while IFS=$'\t' read -r timestamp old new ref pid worktree tool git_cmd; do
+    entry_number=$((entry_number + 1))
+    [[ "${ENTRY_HAS_WORK[$entry_number]:-0}" -eq 1 ]] || continue
+    old_key="${ENTRY_OLD_KEYS[$entry_number]:-$old}"
+
+    if entry_is_preserved "$entry_number" "$old_key"; then
+      if [[ "$EXPLAIN" -eq 1 ]]; then
+        echo "gt-audit: $old_key preserved by ${OLD_PRESERVING_OID[$old_key]} (${OLD_METHOD[$old_key]})" >&2
+      fi
+      continue
+    fi
+
+    reason="$(entry_reason "$entry_number" "$old_key")"
+    if [[ "$EXPLAIN" -eq 1 ]]; then
+      echo "gt-audit: $old_key preservation not verified: $reason" >&2
+    fi
+
+    printed=1
+    echo
+    echo -e "${ANSI_ORANGE}gt-audit: unreachable commits from $ref at $timestamp${ANSI_RESET}"
+    echo "  changes:  preservation not verified"
+    echo "  moved:    $old -> $new"
+    echo "  worktree: $worktree"
+    echo "  ran:      $tool ($git_cmd)"
+    echo "  reason:   $reason"
+    if is_valid_oid "$old"; then
+      recovery_name="$(recovery_branch_name "$ref" "$old")"
+      echo "  recover:  git branch $recovery_name $old"
+    fi
+
+    candidate_file="${ENTRY_CANDIDATE_FILES[$entry_number]:-}"
+    if [[ -n "$candidate_file" && -f "$candidate_file" ]]; then
+      while IFS=$'\t' read -r oid subject; do
+        echo "    $oid $subject"
+      done <"$candidate_file"
+    fi
+  done <"$ENTRIES"
+
+  if [[ "$EXPLAIN" -eq 1 ]]; then
+    echo "gt-audit: virtual comparisons $TOTAL_VIRTUAL_COMPARISONS, limit $MAX_VIRTUAL_COMPARISONS per moved branch, reachable history since $SURVIVING_HISTORY_WINDOW" >&2
+  fi
+  [[ "$printed" -eq 0 ]] || echo
+}
+
+CUTOFF="$(iso_since "$SINCE")" ||
+  fatal "Invalid --since value: $SINCE (expected a number followed by m, h or d)"
+
+trap cleanup EXIT
+trap 'exit 128' HUP INT TERM
+audit_create_repository "$PWD" || fatal "Could not initialize isolated audit storage"
+# `audit_source_git` sets GIT_DIR, and Git then takes the current directory for the work tree root,
+# so the worktree comes from the discovery Git that walks up from $PWD instead.
+SOURCE_ROOT="$AUDIT_SOURCE_ROOT"
+# The hook logs the shell's own PWD, which keeps any symlink the caller walked through, so a move
+# made at the root can be recorded under either spelling of it. This script's own $PWD carries
+# that same spelling, but a run from a subdirectory needs the root's spelling, not the
+# subdirectory's, so a nested invocation strips the same suffix off $PWD that separates the
+# resolved $PWD from SOURCE_ROOT (already resolved, from the discovery Git's --show-toplevel).
+WORKTREE_FILTER="" WORKTREE_FILTER_REAL=""
+if [[ "$ALL_WORKTREES" -eq 0 ]]; then
+  PWD_RESOLVED="$(cd "$PWD" && pwd -P)" || PWD_RESOLVED="$PWD"
+  case "$PWD_RESOLVED" in
+  "$SOURCE_ROOT"/*)
+    WORKTREE_FILTER="${PWD%"${PWD_RESOLVED#"$SOURCE_ROOT"/}"}"
+    WORKTREE_FILTER="${WORKTREE_FILTER%/}"
+    ;;
+  *)
+    WORKTREE_FILTER="$PWD"
+    ;;
+  esac
+  WORKTREE_FILTER_REAL="$SOURCE_ROOT"
+fi
+
+mkdir -p "$SOURCE_ROOT/.repo/local/tmp"
+WORKDIR="$(mktemp -d "$SOURCE_ROOT/.repo/local/tmp/gt-audit.XXXXXX")" ||
+  fatal "Could not create audit working directory"
+
+if [[ -z "$LOG_PATH" ]]; then
+  LOG_PATH="$AUDIT_SOURCE_COMMON_DIR/gather-ref-audit.log"
+fi
+
+LOG_FILES=()
+[[ -f "$LOG_PATH.1" ]] && LOG_FILES+=("$LOG_PATH.1")
+[[ -f "$LOG_PATH" ]] && LOG_FILES+=("$LOG_PATH")
+
+if [[ "${#LOG_FILES[@]}" -eq 0 ]]; then
+  warn "No ref audit log at $LOG_PATH. Set up the hook that writes it: https://github.com/gathertown/eng-workflow#log-branch-moves-for-gt-audit"
+  exit 0
+fi
+
+ENTRIES="$WORKDIR/entries"
+# Git records packed-ref deletion twice, so collapse consecutive copies of the same move.
+awk -F'\t' -v cutoff="$CUTOFF" -v worktree="$WORKTREE_FILTER" \
+  -v worktree_real="$WORKTREE_FILTER_REAL" '
+  NF >= 8 && $1 >= cutoff && (worktree == "" || $6 == worktree || $6 == worktree_real) &&
+    !($2 == old && $3 == new && $4 == ref) {
+    print
+    old = $2
+    new = $3
+    ref = $4
+  }
+' "${LOG_FILES[@]}" >"$ENTRIES"
+
+if [[ "$MODE" == "list" ]]; then
+  if [[ ! -s "$ENTRIES" ]]; then
+    warn "No refs/heads moves since $CUTOFF."
+    exit 0
+  fi
+  awk -F'\t' '{
+    printf "%s  %s..%s  %s\n    %s\n    %s | %s\n", $1, substr($2, 1, 9), substr($3, 1, 9), $4, $6, $7, $8
+  }' "$ENTRIES"
+  exit 0
+fi
+
+[[ -s "$ENTRIES" ]] || exit 0
+
+if ! run_attempt 1; then
+  if ! run_attempt 2; then
+    REFS_CHANGED=1
+  fi
+fi
+
+render_results

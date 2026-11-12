@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+# Source util functions
+# shellcheck source=./lib/stdlib.sh
+. "$(dirname "$0")/lib/stdlib.sh"
+
+# Help text
+usage() {
+  cat <<EOF
+Usage: $(basename "${0}") [options]
+
+Fixes a branch where graphite assumes the branch is updated remotely without squashing commits.
+Works by git pull, merge, git push, then gt get --force to update the branch in graphite.
+
+Options:
+  -h,                  Print this help message
+
+EOF
+  exit "${1:-0}"
+}
+
+# Parse command line arguments
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+  -h | --help)
+    usage
+    ;;
+  -*)
+    echo "Unknown option: $1" >&2
+    usage
+    ;;
+  *)
+    break
+    ;;
+  esac
+done
+
+if [[ $# -ne 0 ]]; then
+  usage 1
+fi
+
+CURRENT_BRANCH=$(git branch --show-current)
+
+# Pull in remote changes, merge them in to the current branch
+{ git pull; } &
+spinner "Pulling in remote changes to ensure we don't miss anything" || fatal "Failed to pull in remote changes"
+
+# rebase it off of the downstack branch (likely main)
+PARENT_BRANCH=$(gt parent)
+{ git rebase "${PARENT_BRANCH}"; } &
+spinner "Rebasing off of the downstack branch (${PARENT_BRANCH})" || warn "Failed to rebase off of the downstack branch (${PARENT_BRANCH})"
+
+while ! git rebase --continue; do
+  warn "Please continue resolving rebase conflicts"
+done
+
+# Push the changes to the remote, we're going to use --force to take what's remote
+{ git push --force-with-lease --force-if-includes; } &
+spinner "Pushing changes to the remote (with --force-with-lease --force-if-includes)" || fatal "Failed to push changes to the remote"
+
+# Get the latest changes from the remote, forcing overwrite of local with --force
+{ gt get "$CURRENT_BRANCH" --no-restack --force; } &
+spinner "Force updating graphite's local branch tracking with the remote" || fatal "Failed to update the local graphite branch tracking"
+
+# Sync the branches, which will restack the current branch (and rest of stack) on
+# the latest downstack branch (likely main)
+{ gt sync --no-restack; } &
+spinner "Running gt sync" || fatal "gt sync failed"
+
+{ gt restack; } &
+spinner "Restacking this branch" || fatal "gt restack failed"
+
+success "Unstuck $CURRENT_BRANCH. Don't forget to submit the changes."

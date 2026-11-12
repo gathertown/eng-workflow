@@ -1,0 +1,6 @@
+{
+  "name": "gather",
+  "description": "Claude Code plugins from Gather",
+  "owner": { "name": "Gather", "url": "https://github.com/gathertown" },
+  "plugins": [{ "name": "eng", "source": "./plugins/eng", "category": "development" }]
+}

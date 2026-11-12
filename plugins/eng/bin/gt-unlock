@@ -1,0 +1,239 @@
+#!/usr/bin/env bash
+
+# Inspects, and optionally breaks, the lock `bin/gt` uses to serialize Graphite
+# writes across worktrees.
+#
+# The only authoritative free/busy answer is a non-blocking acquisition of the
+# same inode. `lsof` lists every process with the file open, waiters included,
+# and macOS lsof does not mark which one holds the flock, so attribution here is
+# a hint from the holder record and never proof.
+#
+# The lock file itself is never removed, renamed or truncated: locks attach to
+# an inode, so replacing it would leave two processes holding locks on two
+# different files and quietly stop serializing anything.
+
+set -uo pipefail
+
+SCRIPTDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# shellcheck source=./lib/stdlib.sh
+source "$SCRIPTDIR/lib/stdlib.sh"
+# shellcheck source=./lib/gt-lock.sh
+source "$SCRIPTDIR/lib/gt-lock.sh"
+
+readonly GRACE_SECONDS=10
+
+KILL=false
+FORCE=false
+
+usage() {
+  echo "Usage: $(basename "$0") [FLAGS]"
+  echo
+  echo "Reports whether another worktree holds the gt lock, and who."
+  echo
+  echo "FLAGS"
+  echo "  --kill             Signal the holder, then confirm the lock was released"
+  echo "  --force            Skip the confirmation prompt (only valid with --kill)"
+  echo "  --help,-h          Show this help page"
+  echo
+  echo "EXIT STATUS"
+  echo "  0  the lock is free, or --kill released it"
+  echo "  1  the lock is held, or the holder could not be identified well enough to signal"
+  echo "  2  bad usage"
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+  --kill)
+    KILL=true
+    shift
+    ;;
+  --force)
+    FORCE=true
+    shift
+    ;;
+  --help | -h)
+    usage
+    exit 0
+    ;;
+  *)
+    error "Unknown option: $1"
+    usage >&2
+    exit 2
+    ;;
+  esac
+done
+
+if [[ "$FORCE" == true && "$KILL" == false ]]; then
+  error "--force only makes sense with --kill"
+  exit 2
+fi
+
+COMMON_DIR="$(common_git_dir "$PWD")" ||
+  fatal "Not inside a git repository"
+LOCK="$COMMON_DIR/$LOCK_BASENAME"
+HOLDER="$LOCK.holder"
+
+if [[ ! -f "$LOCK" ]]; then
+  success "No gt lock has ever been taken in $COMMON_DIR."
+  exit 0
+fi
+
+LOCK_TOOL="$(select_lock_tool)" ||
+  fatal "Neither flock nor lockf is available, so the lock state cannot be read."
+
+# `exec {fd}>` needs bash 4.1, and the only authoritative free/busy test is an
+# acquisition on that descriptor. `bin/gt` refuses the same way rather than
+# locking through a fixed descriptor, which stock macOS bash 3.2 would allow but
+# would let it clobber whatever the caller already had open there.
+if [[ "${BASH_VERSINFO[0]}" -lt 4 ]] ||
+  { [[ "${BASH_VERSINFO[0]}" -eq 4 ]] && [[ "${BASH_VERSINFO[1]}" -lt 1 ]]; }; then
+  fatal "bash $BASH_VERSION cannot test the lock; bash 4.1 or newer is required."
+fi
+
+# trial_acquire is the authoritative test. The subshell exits immediately, which
+# closes the descriptor and releases anything it took.
+trial_acquire() {
+  (
+    exec {fd}>>"$LOCK" || exit 1
+    lock_attempt 0 "$fd" "$LOCK_TOOL"
+  )
+}
+
+holder_field() {
+  [[ -r "$HOLDER" ]] || return 1
+  awk -F= -v key="$1" '$1 == key { print substr($0, length(key) + 2); exit }' "$HOLDER" 2>/dev/null
+}
+
+report_holder() {
+  local worktree branch subcommand pid acquired
+  worktree="$(holder_field worktree)"
+  branch="$(holder_field branch)"
+  subcommand="$(holder_field subcommand)"
+  pid="$(holder_field pid)"
+  acquired="$(holder_field acquired)"
+  if [[ -z "$worktree$pid" ]]; then
+    warn "  holder unknown (no usable record at $HOLDER)"
+    return
+  fi
+  echo "  command:  gt ${subcommand:-?}"
+  echo "  pid:      ${pid:-?}"
+  echo "  worktree: ${worktree:-?}"
+  echo "  branch:   ${branch:-?}"
+  echo "  since:    ${acquired:-?}"
+}
+
+# holder_matches_record revalidates identity immediately before each signal, so
+# a reused pid cannot be targeted. Process start time is the discriminator; the
+# recorded common dir keeps this from ever selecting an unrelated process.
+holder_matches_record() {
+  local pid uid start_time recorded_common live_uid live_start
+  pid="$(holder_field pid)"
+  uid="$(holder_field uid)"
+  start_time="$(holder_field start_time)"
+  recorded_common="$(holder_field common_dir)"
+
+  [[ -n "$pid" && "$pid" =~ ^[0-9]+$ ]] || return 1
+  [[ "$pid" != "$$" && "$pid" != "$PPID" ]] || return 1
+  [[ "$recorded_common" == "$COMMON_DIR" ]] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+
+  live_uid="$(ps -o uid= -p "$pid" 2>/dev/null | tr -d ' ')"
+  live_start="$(ps -o lstart= -p "$pid" 2>/dev/null | tr -d '\n')"
+  [[ -n "$live_uid" && "$live_uid" == "$uid" ]] || return 1
+  [[ -n "$live_start" && "$live_start" == "$start_time" ]] || return 1
+}
+
+# kill_gt_child ends the real gt before the lock can change hands. The child is
+# revalidated as a live child of the recorded holder, so a reused pid can't be
+# targeted; an unrecognized one is left alone rather than guessed at.
+kill_gt_child() {
+  local child live_parent
+  child="$(holder_field child_pid)"
+  [[ -n "$child" && "$child" =~ ^[0-9]+$ ]] || return 0
+  [[ "$child" != "$$" && "$child" != "$PPID" ]] || return 0
+  live_parent="$(ps -o ppid= -p "$child" 2>/dev/null | tr -d ' ')"
+  [[ "$live_parent" == "$HOLDER_PID" ]] || return 0
+  kill -KILL "$child" 2>/dev/null
+}
+
+# wait_for_release polls the authoritative test rather than the pid, because a
+# descendant that inherited the descriptor keeps the lock after the pid is gone.
+wait_for_release() {
+  local deadline=$((SECONDS + GRACE_SECONDS))
+  while [[ "$SECONDS" -lt "$deadline" ]]; do
+    trial_acquire && return 0
+    sleep 0.2
+  done
+  return 1
+}
+
+trial_acquire
+state=$?
+
+if [[ "$state" -eq 0 ]]; then
+  success "The gt lock is free."
+  exit 0
+fi
+
+if [[ "$state" -ne "$CONTENTION_STATUS" ]]; then
+  fatal "Could not test $LOCK: $LOCK_TOOL exited $state"
+fi
+
+warn "The gt lock is held."
+report_holder
+
+if [[ "$KILL" == false ]]; then
+  echo
+  echo "Wait for it, or run '$(basename "$0") --kill' to end the holder."
+  exit 1
+fi
+
+if ! holder_matches_record; then
+  error "busy; holder unknown — the record does not match a live process in this repo."
+  error "Refusing to signal anything. Find the holder by hand before killing it."
+  exit 1
+fi
+
+HOLDER_PID="$(holder_field pid)"
+HOLDER_WORKTREE="$(holder_field worktree)"
+
+if [[ "$FORCE" == false ]]; then
+  echo
+  warn "Killing a gt command mid-flight can leave $HOLDER_WORKTREE half-rebased."
+  warn "Whoever owns it will need 'gt continue' or 'gt abort' there."
+  yn_prompt "Signal pid $HOLDER_PID?" || {
+    echo "Left alone."
+    exit 1
+  }
+fi
+
+holder_matches_record || fatal "The holder changed identity before it could be signaled."
+kill -TERM "$HOLDER_PID" 2>/dev/null
+
+if wait_for_release; then
+  success "The holder ended and the lock is free."
+  exit 0
+fi
+
+if holder_matches_record; then
+  warn "Still held after SIGTERM. Escalating to SIGKILL."
+  # The real gt runs as a child of the wrapper with the lock descriptor closed,
+  # so killing only the wrapper frees the lock while gt keeps writing refs and
+  # another worktree is admitted alongside it. gt goes first, in the one order
+  # that never leaves an unlocked mutator behind.
+  kill_gt_child
+  kill -KILL "$HOLDER_PID" 2>/dev/null
+  if wait_for_release; then
+    success "The holder was killed and the lock is free."
+    exit 0
+  fi
+  error "The lock is still held after SIGKILL."
+  error "A descendant that inherited the descriptor may be holding it. Check:"
+  error "  lsof $LOCK"
+  exit 1
+fi
+
+warn "The original holder ended, but the lock now belongs to someone else."
+report_holder
+exit 1

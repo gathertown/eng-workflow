@@ -1,0 +1,9 @@
+{
+  "name": "eng",
+  "description": "Skills we use at Gather to improve our engineering workflow",
+  "author": { "name": "Gather", "url": "https://github.com/gathertown" },
+  "homepage": "https://github.com/gathertown/eng-workflow",
+  "repository": "https://github.com/gathertown/eng-workflow",
+  "license": "MIT",
+  "keywords": ["graphite", "pull-requests", "stacked-prs", "planning", "writing"]
+}

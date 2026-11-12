@@ -1,0 +1,115 @@
+#!/usr/bin/env bash
+# Symlinks gitignored config files from the main repo into a worktree.
+#
+# Worktrees are by convention made outside the main repo, so gitignored files
+# (Claude config, env configs, credentials, local settings) don't exist in them.
+# This script symlinks those files so worktrees work out of the box.
+#
+# The files come from .claude/eng/worktree-symlinks.txt in the worktree: one
+# repo-relative path per line, globs allowed, # for comments. If
+# .claude/eng/worktree-setup.sh exists, it runs after the links, with MAIN_REPO
+# and WORKTREE_ROOT set, for any repo-specific setup.
+#
+# Usage:
+#   ./bin/symlink-gitignored-files-for-worktree
+#
+# Designed to run from a worktree's root. Resolves the main repo via
+# `git worktree list`. Safe to re-run (ln -s never replaces an existing path).
+
+set -euo pipefail
+
+# --- Resolve main repo -------------------------------------------------------
+# Canonicalize both paths (resolve symlinks) so the equality check on the next
+# line is reliable and ln -sf never points a file at itself.
+main_repo="$(git worktree list --porcelain | head -1 | sed 's/^worktree //')"
+
+if [[ -z "$main_repo" ]]; then
+  echo "error: could not determine main repo path from 'git worktree list'" >&2
+  exit 1
+fi
+main_repo="$(cd "$main_repo" && pwd -P)"
+
+worktree_root="$(cd "$(git rev-parse --show-toplevel)" && pwd -P)"
+
+if [[ "$worktree_root" == "$main_repo" ]]; then
+  echo "Already in the main repo — nothing to symlink."
+  exit 0
+fi
+
+# --- File list ---------------------------------------------------------------
+list_file="$worktree_root/.claude/eng/worktree-symlinks.txt"
+setup_hook="$worktree_root/.claude/eng/worktree-setup.sh"
+
+# --- Symlink each file -------------------------------------------------------
+linked=0
+skipped=0
+
+link_file() {
+  local file="$1" src dest current_target
+  src="$main_repo/$file"
+  dest="$worktree_root/$file"
+
+  if [[ ! -e "$src" ]]; then
+    echo "skip: $file (not found in main repo)"
+    ((skipped++)) || true
+    return
+  fi
+
+  mkdir -p "$(dirname "$dest")"
+  if [[ -d "$dest" && ! -L "$dest" ]]; then
+    echo "skip: $file (real directory exists — preserving override)"
+    ((skipped++)) || true
+    return
+  fi
+
+  # Preserve user overrides: if dest already exists as a real file or as a
+  # symlink pointing somewhere other than $src, leave it alone. To resync
+  # against the main repo, delete the file and re-run this script.
+  if [[ -L "$dest" ]]; then
+    current_target="$(readlink "$dest")"
+    if [[ "$current_target" == "$src" ]]; then
+      echo "  ok: $file (already linked)"
+      ((linked++)) || true
+      return
+    fi
+    echo "skip: $file (symlink points elsewhere — preserving override)"
+    ((skipped++)) || true
+    return
+  fi
+  if [[ -e "$dest" ]]; then
+    echo "skip: $file (real file exists — preserving override)"
+    ((skipped++)) || true
+    return
+  fi
+
+  ln -s "$src" "$dest"
+  echo "  ok: $file (linked)"
+  ((linked++)) || true
+}
+
+if [[ -f "$list_file" ]]; then
+  while IFS= read -r pattern || [[ -n "$pattern" ]]; do
+    [[ -z "$pattern" || "$pattern" == \#* ]] && continue
+    matches=()
+    while IFS= read -r match; do
+      matches+=("$match")
+    done < <(cd "$main_repo" && { compgen -G "$pattern" || true; })
+    if [[ ${#matches[@]} -eq 0 ]]; then
+      echo "skip: $pattern (not found in main repo)"
+      ((skipped++)) || true
+      continue
+    fi
+    for match in "${matches[@]}"; do
+      link_file "$match"
+    done
+  done <"$list_file"
+else
+  echo "No ${list_file#"$worktree_root"/}, nothing to link."
+fi
+
+echo "Done. Linked $linked file(s), skipped $skipped."
+
+# --- Repo-specific setup -----------------------------------------------------
+if [[ -f "$setup_hook" ]]; then
+  MAIN_REPO="$main_repo" WORKTREE_ROOT="$worktree_root" bash "$setup_hook"
+fi

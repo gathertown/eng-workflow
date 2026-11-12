@@ -1,0 +1,36 @@
+{
+  "name": "gather-design",
+  "version": "0.0.0",
+  "private": true,
+  "license": "MIT",
+  "type": "module",
+  "nx": {
+    "targets": {
+      "build:types": {
+        "command": "tsc --noEmit",
+        "inputs": [
+          "sharedGlobals",
+          "{projectRoot}/src/**/*",
+          "{projectRoot}/testHelpers/**/*",
+          "{projectRoot}/**/*.ts",
+          "{projectRoot}/tsconfig.json",
+          "{projectRoot}/package.json",
+          "{workspaceRoot}/tsconfig.base.json",
+          {
+            "dependentTasksOutputFiles": "**/*.d.ts",
+            "transitive": true
+          }
+        ],
+        "outputs": []
+      }
+    }
+  },
+  "devDependencies": {
+    "@types/node": "~26.6.6",
+    "@typescript/native": "npm:typescript@~7.0.2",
+    "playwright": "1.61.1"
+  },
+  "peerDependencies": {
+    "playwright": "^1.61.1"
+  }
+}

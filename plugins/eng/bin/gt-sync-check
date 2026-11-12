@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+
+# Asks whether a `gt sync` here would reset a branch another worktree moved and has not pushed.
+#
+# bin/gt runs the same check on its own `sync` subcommand. This exists for the callers that drive
+# Graphite themselves, like a script that lands a stack, so they can fail before the first merge
+# instead of mid-loop. bin/lib/gt-sync-guard.sh explains what counts.
+
+set -uo pipefail
+
+SCRIPTDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# shellcheck source=./lib/stdlib.sh
+source "$SCRIPTDIR/lib/stdlib.sh"
+# shellcheck source=./lib/gt-sync-guard.sh
+source "$SCRIPTDIR/lib/gt-sync-guard.sh"
+
+usage() {
+  echo "Usage: $(basename "$0") [FLAGS]"
+  echo
+  echo "Reports branches a 'gt sync' here would reset out from under another worktree."
+  echo
+  echo "FLAGS"
+  echo "  --help,-h          Show this help page"
+  echo
+  echo "EXIT STATUS"
+  echo "  0  sync is safe to run"
+  echo "  1  sync would reset another worktree's unsubmitted branch"
+  echo "  2  the check could not run, which is not a reason to hold sync back"
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+  --help | -h)
+    usage
+    exit 0
+    ;;
+  *)
+    error "Unknown option: $1"
+    usage >&2
+    exit 2
+    ;;
+  esac
+done
+
+COMMON_DIR="$(common_git_dir "$PWD")" || fatal "Could not resolve the git common directory for $PWD"
+
+sync_guard_check "$PWD" "$COMMON_DIR"
